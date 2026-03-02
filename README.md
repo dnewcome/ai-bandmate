@@ -2,13 +2,14 @@
 
 A real-time AI accompaniment system. Play into a MIDI controller and the system
 listens to your notes, figures out what key and tempo you are in, and generates
-a matching bass line that follows you as you play — changing keys and tempo on
-the fly as you move through a song.
+a matching bass line and drum groove that follows you as you play — changing
+keys and tempo on the fly as you move through a song.
 
-This is Phase 1 of a larger project. The current system uses rule-based
-generation built on live music analysis. Future phases add neural drum
-generation (Magenta GrooVAE), LLM-driven style orchestration (Ollama), and
-audio input from a guitar pickup.
+The system also plays your MIDI controller through a chosen instrument (piano or
+clean electric guitar) so you hear yourself in the mix alongside the band.
+
+Future phases add LLM-driven style orchestration (Ollama) and audio input from
+a guitar pickup.
 
 ---
 
@@ -20,6 +21,7 @@ audio input from a guitar pickup.
   - [Key Detection](#key-detection)
   - [Tempo Tracking](#tempo-tracking)
   - [Bass Generation](#bass-generation)
+  - [Drum Generation](#drum-generation)
   - [Audio Output](#audio-output)
   - [Threading Model](#threading-model)
 - [Installation](#installation)
@@ -34,9 +36,9 @@ audio input from a guitar pickup.
 - [Project Structure](#project-structure)
 - [Extending the System](#extending-the-system)
   - [Adding Bass Patterns](#adding-bass-patterns)
-  - [Phase 2: Drum Generation](#phase-2-drum-generation)
-  - [Phase 3: LLM Style Orchestration](#phase-3-llm-style-orchestration)
-  - [Phase 4: Guitar Audio Input](#phase-4-guitar-audio-input)
+  - [Adding Drum Patterns](#adding-drum-patterns)
+  - [Phase 2: LLM Style Orchestration](#phase-2-llm-style-orchestration)
+  - [Phase 3: Guitar Audio Input](#phase-3-guitar-audio-input)
 - [Hardware Notes](#hardware-notes)
 - [Troubleshooting](#troubleshooting)
 
@@ -53,33 +55,41 @@ MIDI Controller
       ▼
  MidiBuffer ──────────────────────────────────┐
       │                                        │
-      │  pitch class histogram (every 2s)      │  note-on timestamps
+      │  pitch class histogram (every 1s)      │  note-on timestamps
       ▼                                        ▼
  KeyDetector                            TempoTracker
       │                                        │
-      │  root note + mode                      │  BPM + confidence
-      └──────────────────┬─────────────────────┘
-                         │
-                         ▼
-                   BassGenerator
-                  (background thread)
-                         │
-                         │  MIDI note-on / note-off
-                         ▼
-                       Synth
-                   (FluidSynth)
-                         │
-                         ▼
-                   Audio Output
-               (PulseAudio / ALSA)
+      │  root note + mode           BPM + confidence
+      └──────────────┬──────────────────────┬──┘
+                     │                      │
+              ┌──────┘                      └──────┐
+              ▼                                    ▼
+       BassGenerator                       DrumGenerator
+      (background thread)                (background thread)
+              │                                    │
+              └──────────────┬─────────────────────┘
+                             │  MIDI note-on / note-off
+                             ▼
+                 ┌─────────────────────┐
+                 │        Synth        │
+                 │     (FluidSynth)    │
+                 │  ch 0: lead inst.   │◄── MIDI passthrough (your playing)
+                 │  ch 1: bass         │◄── BassGenerator
+                 │  ch 9: drums        │◄── DrumGenerator
+                 └─────────────────────┘
+                             │
+                             ▼
+                       Audio Output
+                   (PulseAudio / ALSA)
 ```
 
-Every incoming MIDI note feeds two subsystems simultaneously: the `MidiBuffer`
-accumulates notes for key analysis, and the `TempoTracker` records the timing
-of each onset for BPM estimation. A background analysis thread re-runs key
-detection every two seconds and updates the bass generator. The bass generator
-runs in its own thread, looping bar by bar, picking up parameter changes at
-each bar boundary so transitions are always musically clean.
+Every incoming MIDI note feeds three things simultaneously: the `MidiBuffer`
+accumulates notes for key analysis, the `TempoTracker` records onset timing for
+BPM estimation, and the note is passed through to FluidSynth so you hear
+yourself playing. A background analysis thread re-runs key detection every
+second and hot-updates both generators. Each generator runs in its own thread,
+looping bar by bar and picking up parameter changes at bar boundaries so
+transitions are always musically clean.
 
 ---
 
@@ -104,8 +114,10 @@ Each note contributes its velocity/127 to that bucket.
 Result is normalized so all 12 values sum to 1.0.
 ```
 
-Using velocity weighting means harder-played notes (roots, chord tones) have
-more influence on key detection than light embellishments.
+Weights also decay **exponentially with age** — a note played 3 seconds ago
+contributes ~37% as much as a note played right now. This means a key change
+registers within a few seconds rather than waiting for old notes to age out of
+the full 8-second window.
 
 ---
 
@@ -146,8 +158,8 @@ Pearson r = dot(h - mean(h), p - mean(p)) / (|h - mean(h)| * |p - mean(p)|)
 ```
 
 The returned `confidence` value is the raw Pearson correlation coefficient
-(range -1 to 1). Values above ~0.6 are generally reliable. The system only
-acts on detections above 0.4.
+(range -1 to 1). Values above ~0.6 are generally reliable. The system updates
+on any detection above 0.2 and re-evaluates every second.
 
 **Known limitations:** The algorithm can be confused by highly chromatic playing,
 modal music, or playing over a short window where not enough pitch classes have
@@ -169,21 +181,19 @@ The algorithm:
 1. Record the timestamp of every note-on event using `time.monotonic()`
 2. Compute the IOI between each pair of consecutive onsets
 3. Reject IOIs outside the valid tempo range (40–240 BPM)
-4. Keep a rolling window of up to 16 recent IOIs
-5. Take the **median** of the window to get a robust estimate robust to outliers
-6. Try three subdivision hypotheses: the median IOI might represent a half note
+4. If a gap > 2 seconds is detected, clear the IOI buffer — the player paused,
+   and stale intervals would corrupt the new estimate
+5. Keep a rolling window of up to 8 recent IOIs
+6. Take the **median** of the window to get an estimate robust to outliers
+7. Try three subdivision hypotheses: the median IOI might represent a half note
    (×2), a quarter note (×1), or an eighth note (×0.5)
-7. Of the valid candidates, pick the one closest to 120 BPM (the most common
-   musical tempo, used as a Bayesian prior)
-8. Compute **confidence** as `1 - (std / median)` — lower variance among recent
-   IOIs means higher confidence
-
-The median is used rather than the mean because a single long gap (e.g. you
-pause between phrases) would skew a mean significantly but barely moves the
-median.
+8. Of the valid candidates, pick the one closest to 120 BPM (a prior toward
+   common musical tempos)
+9. Compute **confidence** as `1 - (std / median)` — lower variance means higher
+   confidence
 
 Confidence crosses 0.3 fairly quickly once you play a few evenly-spaced notes,
-which is the threshold used to start the bass generator.
+which is the threshold used to start the band.
 
 ---
 
@@ -223,20 +233,6 @@ duration_beats)` tuples describing where in the bar each note falls:
 | `walking_minor` | Root → minor third → fifth → octave. Jazz/soul in minor keys. |
 | `blues` | Root and fifth alternating on eighth notes. Shuffle-ready blues. |
 
-#### Style Mapping
-
-Styles are aliases for patterns, making it easy to extend:
-
-```python
-STYLE_PATTERN_MAP = {
-    "rock":       "root_fifth",
-    "blues":      "blues",
-    "jazz":       "walking_major",
-    "jazz_minor": "walking_minor",
-    "minimal":    "root_on_one",
-}
-```
-
 #### Playback Loop
 
 The generator runs in a dedicated **daemon thread**. Each iteration:
@@ -255,6 +251,51 @@ changes that would sound jarring.
 
 ---
 
+### Drum Generation
+
+**File:** `generators/drum_generator.py`
+
+The drum generator produces GM percussion events on MIDI channel 9. Like the
+bass generator it loops bar-by-bar in a background thread, picking up BPM and
+style changes at each bar boundary.
+
+#### Patterns
+
+Each drum pattern is a list of `(beat_offset, gm_note, base_velocity,
+vel_variation)` tuples. `vel_variation` adds a random `±N` to `base_velocity`
+on every hit, giving a slightly human feel rather than a rigid machine grid.
+
+Swing and shuffle feels are encoded directly in `beat_offset` values using
+triplet 8th note positions (multiples of 2/3 of a beat) rather than straight
+8ths (multiples of 0.5).
+
+**GM percussion notes used:**
+
+| Constant | GM Note | Instrument |
+|---|---|---|
+| `KICK` | 36 | Bass Drum 1 |
+| `SNARE` | 38 | Acoustic Snare |
+| `HIHAT_CLOSED` | 42 | Closed Hi-Hat |
+| `HIHAT_PEDAL` | 44 | Pedal Hi-Hat |
+| `HIHAT_OPEN` | 46 | Open Hi-Hat |
+| `RIDE` | 51 | Ride Cymbal 1 |
+| `CRASH` | 49 | Crash Cymbal 1 |
+
+**Patterns per style:**
+
+| Style | Kick | Snare | Hat/Ride |
+|---|---|---|---|
+| `rock` | beats 1, 3 | beats 2, 4 | straight 8th closed hat |
+| `blues` | beats 1, 3 | beats 2, 4 | swing 8th (shuffle) closed hat |
+| `jazz` | light on beat 1 | — | swing ride + pedal hat on 2 & 4 |
+| `jazz_minor` | same as jazz | — | same as jazz |
+| `minimal` | beat 1 | beat 3 | none |
+
+Drum note-offs are fired 60ms after each note-on — percussion sounds in GM
+soundfonts are self-sustaining samples and do not need long held notes.
+
+---
+
 ### Audio Output
 
 **File:** `output/synth.py`
@@ -270,18 +311,25 @@ The `Synth` class wraps the `pyfluidsynth` bindings and handles:
 - Configuring MIDI channels with General MIDI programs (instruments)
 - Dispatching `note_on` and `note_off` events
 
-**General MIDI instrument numbers** used:
+**MIDI channel assignments:**
+
+| Channel | Role | Instrument |
+|---|---|---|
+| 0 | Lead (your playing) | Piano or Clean Electric Guitar |
+| 1 | Bass | Finger Bass (GM 33) |
+| 9 | Drums | GM Percussion (bank 128) |
+
+**General MIDI instrument numbers available:**
 
 | Name | GM Program | Description |
 |---|---|---|
+| `piano` | 0 | Acoustic Grand Piano |
+| `clean_guitar` | 27 | Electric Guitar (clean) |
 | `bass_finger` | 33 | Fingered electric bass |
 | `bass_pick` | 34 | Picked electric bass |
 | `bass_fretless` | 35 | Fretless bass |
 | `upright_bass` | 32 | Acoustic upright bass |
 | `synth_bass` | 38 | Synth bass 1 |
-
-The bass is placed on **MIDI channel 1**. MIDI channel 9 (0-indexed) is
-reserved by the General MIDI standard for drums and will be used in Phase 2.
 
 If the synth fails to initialize (missing soundfont, audio driver issue), the
 system falls back gracefully and continues running in analysis-only mode,
@@ -291,22 +339,20 @@ printing state to the terminal.
 
 ### Threading Model
 
-The system runs four concurrent threads:
-
 | Thread | Role |
 |---|---|
 | Main thread | Keyboard input polling via `select()`, startup/shutdown |
 | MIDI callback thread | Managed by `python-rtmidi`; calls `midi_message_handler` on each message |
-| Analysis thread | Sleeps 2s, recomputes key + BPM, calls `bass_gen.update_params()` |
+| Analysis thread | Sleeps 1s, recomputes key + BPM, calls `update_params()` on both generators |
 | Bass playback thread | Loops bar-by-bar, sleeps precisely to hit note timings |
+| Drum playback thread | Same structure as bass playback, fires percussion events |
 | Note-off threads | One short-lived thread per note, fires the note-off after duration |
 
 State shared between threads (`current_key`, `bass_started`) uses simple
-Python assignment which is safe for these types due to the GIL. The bass
-generator's `_next_root / _next_mode / _next_bpm` fields are written by the
-analysis thread and read by the playback thread at bar boundaries — no mutex
-is needed because a slightly stale read just means the change takes one extra
-bar, which is musically fine.
+Python assignment which is safe for these types due to the GIL. Each
+generator's `_next_*` fields are written by the analysis thread and read by the
+playback thread at bar boundaries — no mutex is needed because a slightly stale
+read just means the change takes one extra bar, which is musically fine.
 
 ---
 
@@ -327,8 +373,8 @@ sudo apt install libasound2-dev libjack-dev
 
 ### Python Dependencies
 
-Python 3.11 or newer is required (uses `list[T]` type hints without `from
-__future__ import annotations` and `X | Y` union syntax).
+Python 3.11 or newer is required (uses `list[T]` type hints and `X | Y` union
+syntax).
 
 ```bash
 pip install -r requirements.txt
@@ -373,29 +419,37 @@ Example output:
 
 ```
 Available MIDI input ports:
-  [0] Arturia MiniLab mkII 0
-  [1] Midi Through Port-0
+  [0] Midi Through Port-0
+  [1] X2mini MIDI 1
 ```
 
 ### Run
 
 ```bash
-# Use the first available MIDI port, rock style
+# Interactive prompts for port and instrument selection
 python main.py
 
-# Specify style
-python main.py --style blues
-
-# Specify MIDI port by name (partial match, case-insensitive)
-python main.py --port "MiniLab" --style jazz
+# Skip prompts with flags
+python main.py --port X2mini --instrument piano --style rock
+python main.py --port X2mini --instrument clean_guitar --style blues
 
 # Specify a custom soundfont
-python main.py --sf2 ~/soundfonts/GeneralUser.sf2
+python main.py --port X2mini --instrument piano --sf2 ~/soundfonts/GeneralUser.sf2
 ```
 
-The bass will not start immediately. The system waits until the tempo tracker
+At startup you will be prompted to choose your lead instrument if `--instrument`
+is not provided:
+
+```
+Select your instrument:
+  [1] Piano
+  [2] Clean Electric Guitar
+Choice [1-2]:
+```
+
+The band does not start immediately. The system waits until the tempo tracker
 has enough confidence (after roughly 4–8 evenly-spaced notes) before engaging
-the bass. This prevents it from starting in the wrong key or at the wrong tempo.
+bass and drums together.
 
 ### Keyboard Controls
 
@@ -404,24 +458,25 @@ While the program is running, single keypresses control the system:
 | Key | Action |
 |---|---|
 | `s` | Print current key, BPM, confidence scores, and active style |
-| `1` | Switch to **rock** style (root + fifth) |
-| `2` | Switch to **blues** style (eighth-note root/fifth alternation) |
-| `3` | Switch to **jazz** style (walking major: 1-3-5-7) |
-| `4` | Switch to **jazz_minor** style (walking minor: 1-b3-5-8va) |
-| `5` | Switch to **minimal** style (root on beat 1 only) |
+| `1` | Switch to **rock** style |
+| `2` | Switch to **blues** style |
+| `3` | Switch to **jazz** style |
+| `4` | Switch to **jazz_minor** style |
+| `5` | Switch to **minimal** style |
 | `q` | Quit cleanly |
 
-Style changes take effect at the next bar boundary.
+Style changes affect both bass and drums simultaneously, taking effect at the
+next bar boundary.
 
 ### Styles
 
-| Style | Pattern | Best For |
+| Style | Bass | Drums |
 |---|---|---|
-| `rock` | Root on 1, fifth on 3 | Rock, pop, country |
-| `blues` | Root/fifth on 8th notes | Blues, R&B, shuffle feels |
-| `jazz` | Walking 1-3-5-7 | Jazz, swing, major-key tunes |
-| `jazz_minor` | Walking 1-b3-5-octave | Minor jazz, soul, bossa |
-| `minimal` | Root on beat 1 only | Sparse arrangements, ballads |
+| `rock` | Root on 1, fifth on 3 | Kick 1&3, snare 2&4, straight 8th hat |
+| `blues` | Root/fifth shuffle 8ths | Kick 1&3, snare 2&4, swing 8th hat |
+| `jazz` | Walking 1-3-5-7 | Swing ride, pedal hat on 2&4, light kick |
+| `jazz_minor` | Walking 1-b3-5-octave | Same as jazz |
+| `minimal` | Root on beat 1 only | Kick on 1, snare on 3, no hat |
 
 ---
 
@@ -433,15 +488,16 @@ ai-bandmate/
 ├── requirements.txt
 ├── analysis/
 │   ├── __init__.py
-│   ├── midi_buffer.py          Rolling note event window + chroma histogram
+│   ├── midi_buffer.py          Rolling note event window + decaying chroma histogram
 │   ├── key_detector.py         Krumhansl-Schmuckler key detection
-│   └── tempo_tracker.py        IOI-based BPM estimation
+│   └── tempo_tracker.py        IOI-based BPM estimation with pause detection
 ├── generators/
 │   ├── __init__.py
-│   └── bass_generator.py       Rule-based bass patterns + playback thread
+│   ├── bass_generator.py       Rule-based bass patterns + playback thread
+│   └── drum_generator.py       Rule-based drum patterns + playback thread
 └── output/
     ├── __init__.py
-    └── synth.py                FluidSynth wrapper
+    └── synth.py                FluidSynth wrapper (lead, bass, drums channels)
 ```
 
 ---
@@ -457,53 +513,64 @@ PATTERNS["reggae"] = [
     (0.75, 1, 0, 0.2),   # skipped beat 1 (anticipation)
     (2.75, 5, 0, 0.2),   # skipped beat 3
 ]
-```
-
-Then map it to a style name:
-
-```python
 STYLE_PATTERN_MAP["reggae"] = "reggae"
 ```
 
-And add it to `STYLE_KEYS` in `main.py`:
+Each tuple is `(beat_offset, scale_degree, octave_shift, duration_beats)`:
+
+- `beat_offset`: Position in the 4/4 bar (0.0 = beat 1, 1.0 = beat 2, 0.5 =
+  the "and" of beat 1, 0.667 = triplet 8th, etc.)
+- `scale_degree`: 1=root, 2=second, 3=third, 4=fourth, 5=fifth, 6=sixth,
+  7=seventh, 8=octave above root
+- `octave_shift`: Shifts the note by octaves (0 = bass register, -1 = lower)
+- `duration_beats`: Note length in beats (0.9 ≈ detached, 0.45 ≈ walking,
+  0.25 ≈ staccato)
+
+### Adding Drum Patterns
+
+Add an entry to `DRUM_PATTERNS` in `generators/drum_generator.py`:
+
+```python
+DRUM_PATTERNS["reggae"] = [
+    # Kick on beat 3 only (one-drop)
+    (2.0,  KICK,          95, 8),
+    # Snare on beats 2 and 4
+    (1.0,  SNARE,         90, 5),
+    (3.0,  SNARE,         95, 5),
+    # Closed hat on all 8th notes
+    (0.0,  HIHAT_CLOSED,  65, 5),
+    (0.5,  HIHAT_CLOSED,  50, 5),
+    (1.0,  HIHAT_CLOSED,  65, 5),
+    (1.5,  HIHAT_CLOSED,  50, 5),
+    (2.0,  HIHAT_CLOSED,  65, 5),
+    (2.5,  HIHAT_CLOSED,  50, 5),
+    (3.0,  HIHAT_CLOSED,  65, 5),
+    (3.5,  HIHAT_CLOSED,  50, 5),
+]
+DRUM_STYLE_MAP["reggae"] = "reggae"
+```
+
+Each tuple is `(beat_offset, gm_note, base_velocity, vel_variation)`:
+
+- `beat_offset`: Position in the bar (same convention as bass patterns)
+- `gm_note`: GM percussion note number (constants defined at top of file)
+- `base_velocity`: MIDI velocity 1–127
+- `vel_variation`: Random `±N` added each hit for a human feel
+
+Then add the new style to `STYLE_KEYS` in `main.py`:
 
 ```python
 STYLE_KEYS = {"1": "rock", "2": "blues", "3": "jazz",
               "4": "jazz_minor", "5": "minimal", "6": "reggae"}
 ```
 
-Each tuple is `(beat_offset, scale_degree, octave_shift, duration_beats)`:
-
-- `beat_offset`: When in the 4/4 bar the note starts (0.0 = beat 1, 1.0 = beat
-  2, 0.5 = the "and" of beat 1, etc.)
-- `scale_degree`: 1=root, 2=second, 3=third, 4=fourth, 5=fifth, 6=sixth,
-  7=seventh, 8=octave above root
-- `octave_shift`: Shifts the note up or down by octaves (0 = bass octave 2,
-  -1 = one octave lower, +1 = one octave higher)
-- `duration_beats`: How long the note holds, in beats (0.9 ≈ slightly detached,
-  0.45 ≈ walking feel, 0.25 ≈ staccato)
-
-### Phase 2: Drum Generation
-
-The next planned phase uses **Magenta GrooVAE**, a VAE-based model trained on
-thousands of drum performances. It takes a simple pattern seed and the current
-tempo and generates a humanized drum groove that matches the feel.
-
-Setup will require:
-
-```bash
-pip install magenta
-```
-
-GrooVAE will run on the GPU via TensorFlow. With a 4070 Super (12GB), inference
-takes under 50ms for a 2-bar pattern, which is fast enough for real-time use.
-The drum output will go to MIDI channel 9 (the GM drums channel) in `Synth`.
-
-### Phase 3: LLM Style Orchestration
+### Phase 2: LLM Style Orchestration
 
 Rather than manually switching styles with keyboard keys, a local LLM watching
 the chord progression over a 4–8 bar window can make higher-level decisions:
 when to build intensity, when to drop back, when to walk up to a chord change.
+It also enables natural language control — typing "play something more funky" or
+"lay back on the drums" rather than pressing a key.
 
 The planned approach uses **Ollama** running **Llama 3.1 8B (Q4_K_M)**
 (approximately 5GB VRAM). The LLM receives a structured prompt every 4 bars:
@@ -514,13 +581,12 @@ Tempo: 118 BPM, confidence: 0.91
 Last 4 bars: chords implied A-C-G-E
 Style currently: minimal
 
-Suggest: bass_style, drum_intensity (0-10), feel
+Suggest: bass_style, drum_style, feel
 ```
 
-With the 4070 Super, the LLM and Magenta can both be in VRAM simultaneously
-(~5GB + ~3GB = ~8GB, well within the 12GB budget).
+With the 4070 Super (12GB VRAM), inference takes well under a bar at 118 BPM.
 
-### Phase 4: Guitar Audio Input
+### Phase 3: Guitar Audio Input
 
 For players without a MIDI guitar pickup, **basic-pitch** (Spotify's neural
 pitch detector) can convert guitar audio to MIDI events in real time:
@@ -532,10 +598,10 @@ pip install basic-pitch
 An audio capture thread reads from the system microphone or a USB audio
 interface and feeds short windows (~50ms) into basic-pitch. The resulting MIDI
 events feed into the same `MidiBuffer` / `TempoTracker` pipeline as the MIDI
-input path, so no other changes are required.
+input path, so no other changes are required downstream.
 
 Recommended guitar-to-computer path for low latency:
-- USB audio interface (Focusrite Scarlett Solo, etc.) with ASIO/ALSA at 128
+- USB audio interface (Focusrite Scarlett Solo, etc.) with ALSA at 128
   samples (~3ms at 44.1kHz)
 - Or a MIDI guitar pickup (Roland GK-3, Fishman TriplePlay) feeding MIDI
   directly — lower latency, no pitch detection needed
@@ -546,14 +612,12 @@ Recommended guitar-to-computer path for low latency:
 
 This system was developed and tested with:
 
-- **NVIDIA RTX 4070 Super (12GB VRAM)** — sufficient for Ollama (Llama 3.1 8B
-  Q4, ~5GB) and Magenta (TensorFlow, ~3GB) simultaneously
+- **NVIDIA RTX 4070 Super (12GB VRAM)** — not currently used; the entire
+  pipeline is CPU-bound and lightweight. The GPU becomes relevant in Phase 2
+  (Ollama LLM inference, ~5GB VRAM).
 - **Linux** with PulseAudio; change `driver="pulseaudio"` to `driver="alsa"` in
   `output/synth.py` for lower-latency ALSA direct access
-- A USB MIDI controller on any port
-
-The current Phase 1 codebase uses no GPU at all — all computation is CPU-bound
-and extremely lightweight. The GPU becomes relevant in Phase 2 and 3.
+- A USB MIDI controller (tested with X2mini)
 
 ---
 
@@ -582,7 +646,7 @@ Or point to one explicitly:
 python main.py --sf2 /path/to/your.sf2
 ```
 
-**Bass doesn't start**
+**Band doesn't start**
 
 The system waits for tempo confidence > 0.3. Play several notes with consistent
 spacing — a simple steady rhythm for 2–3 seconds is enough. Press `s` to see
@@ -604,16 +668,25 @@ sudo chrt -f 50 python main.py
 
 **Key detection is wrong**
 
-- Play in the key for at least 4–8 seconds before the accompaniment kicks in
+- Play in the key for at least 4–8 seconds before the band kicks in
 - Avoid playing notes outside the key early on — chromatic notes confuse the
   histogram before enough diatonic notes accumulate
 - Press `s` to see the confidence score; below 0.5 means the system is uncertain
-- The 8-second window means a sustained key change takes up to 8 seconds to
-  fully register; playing emphatically in the new key speeds this up
+- The exponential decay means recent notes dominate, so playing firmly in a new
+  key for 3–4 seconds is usually enough to shift detection
 
-**Wrong tempo / bass playing at double or half speed**
+**Wrong tempo / band playing at double or half speed**
 
 The subdivision disambiguation logic biases toward 120 BPM. If you play at an
 unusual tempo the system may lock onto a half or double subdivision. Try
-playing a clear steady pulse for a few bars, or temporarily set the analysis
-window shorter by editing `window_seconds` in `main.py`.
+playing a clear steady pulse for a few bars, or set the analysis window shorter
+by editing `window_seconds` in `main.py`.
+
+**SDL3 warning in terminal**
+
+```
+fluidsynth: warning: SDL3 not initialized, SDL3 audio driver won't be usable.
+```
+
+This is harmless. FluidSynth was compiled with optional SDL3 support but falls
+back to PulseAudio automatically. The warning can be ignored.
